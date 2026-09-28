@@ -5,8 +5,10 @@ import { CertificateValidationService } from './services/certificate-validation.
 import { OcspService } from './services/ocsp.service';
 import { TrustChainService } from './services/trust-chain.service';
 import { trustAnchorsProvider } from './services/trust-anchors.provider';
+import { OcspFailureEventsModule } from '../incidents/ocsp-failure-events.module';
 
 @Module({
+  imports: [OcspFailureEventsModule],
   controllers: [CertificateValidationController],
   providers: [
     trustAnchorsProvider,
@@ -14,5 +16,7 @@ import { trustAnchorsProvider } from './services/trust-anchors.provider';
     OcspService,
     CertificateValidationService,
   ],
+  // El chequeo de salud de incidencias consulta OCSP con los mismos servicios que la validación.
+  exports: [OcspService, TrustChainService],
 })
 export class CertificateValidationModule {}

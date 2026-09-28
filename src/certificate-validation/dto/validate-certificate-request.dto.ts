@@ -53,4 +53,28 @@ export class ValidateCertificateRequestDto {
   @IsOptional()
   @IsBoolean()
   allowUnverifiedRevocation?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Identificador de la solicitud de firma que motivó la validación. Sólo se usa para ' +
+      'relacionar el intento con una incidencia si el SAT no responde.',
+    example: 'doc-7c1f2a',
+    maxLength: 255,
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(255)
+  signingRequestId?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Identificador del usuario que está firmando. Sólo se usa para relacionar el intento con ' +
+      'una incidencia si el SAT no responde.',
+    example: 'c68c8d8f-b178-4c8e-ab0e-73caf0ea24e9',
+    maxLength: 255,
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(255)
+  userId?: string;
 }

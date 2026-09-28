@@ -15,6 +15,10 @@ import {
   OcspServiceUnavailableException,
 } from '../exceptions/certificate.exceptions';
 import { OcspEvidence, OcspService } from './ocsp.service';
+import {
+  OcspFailureContext,
+  OcspFailureEventPublisher,
+} from '../../incidents/ocsp-failure-event.publisher';
 import { TrustChainService, oneLine } from './trust-chain.service';
 
 /**
@@ -28,16 +32,18 @@ export class CertificateValidationService {
   /**
    * @param trustChainService - Validación de la cadena contra el almacén del SAT.
    * @param ocspService - Consulta de revocación al respondedor del SAT.
+   * @param ocspFailureEventPublisher - Publica en Kafka cada consulta OCSP que no se pudo hacer.
    * @returns El servicio listo para validar certificados.
    *
    * @example
    * ```ts
-   * const service = new CertificateValidationService(trustChainService, ocspService);
+   * const service = new CertificateValidationService(trustChainService, ocspService, publisher);
    * ```
    */
   constructor(
     private readonly trustChainService: TrustChainService,
     private readonly ocspService: OcspService,
+    private readonly ocspFailureEventPublisher: OcspFailureEventPublisher,
   ) {}
 
   /**
@@ -93,6 +99,11 @@ export class CertificateValidationService {
       certificate,
       chain.issuer,
       request.allowUnverifiedRevocation ?? false,
+      {
+        certificateSerial: certificate.serialNumber,
+        signingRequestId: request.signingRequestId,
+        userId: request.userId,
+      },
     );
 
     return {
@@ -148,19 +159,45 @@ export class CertificateValidationService {
   }
 
   /**
-   * Devuelve `null` sólo cuando el SAT no respondió y la petición lo permite; cualquier otro fallo
-   * (incluido el certificado revocado) se propaga.
+   * Consulta la revocación y, si el SAT no respondió, publica el fallo en Kafka.
+   *
+   * La publicación se dispara sin esperarla: la respuesta al usuario no depende de Kafka. Se
+   * publica en los dos caminos —con y sin `allowUnverifiedRevocation`— porque los dos son un
+   * intento de firma afectado por la caída. Un certificado revocado NO se publica: es una
+   * respuesta del SAT, no su ausencia.
+   *
+   * @param certificate - Certificado a consultar.
+   * @param issuer - Emisor inmediato, resuelto por la cadena de confianza.
+   * @param allowUnverified - Si la caída del SAT se tolera (`null`) en vez de propagarse.
+   * @param failureContext - Datos del intento que viajan en el evento.
+   * @returns La evidencia; `null` sólo cuando el SAT no respondió y la petición lo permite.
+   *
+   * @throws {OcspServiceUnavailableException} Si el SAT no respondió y no se permite seguir.
+   * @throws {CertificateRevokedException} Si el SAT lo reporta revocado.
+   *
+   * @example
+   * ```ts
+   * const evidence = await this.checkRevocation(certificate, issuer, true, { certificateSerial });
+   * ```
    */
   private async checkRevocation(
     certificate: X509Certificate,
     issuer: X509Certificate,
     allowUnverified: boolean,
+    failureContext: OcspFailureContext,
   ): Promise<OcspEvidence | null> {
     try {
       return await this.ocspService.checkRevocation(certificate, issuer);
     } catch (error) {
-      if (allowUnverified && error instanceof OcspServiceUnavailableException) {
-        return null;
+      if (error instanceof OcspServiceUnavailableException) {
+        void this.ocspFailureEventPublisher.publish(
+          error.cause ?? error,
+          failureContext,
+        );
+
+        if (allowUnverified) {
+          return null;
+        }
       }
       throw error;
     }

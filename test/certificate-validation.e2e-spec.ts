@@ -1,16 +1,18 @@
 import { INestApplication, Logger } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
 import { Test } from '@nestjs/testing';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import * as request from 'supertest';
 
-import { AppModule } from '../src/app.module';
+import { CertificateValidationModule } from '../src/certificate-validation/certificate-validation.module';
 import { configureApp } from '../src/app.setup';
 import {
   CertificateRevokedException,
   OcspServiceUnavailableException,
 } from '../src/certificate-validation/exceptions/certificate.exceptions';
 import { OcspService } from '../src/certificate-validation/services/ocsp.service';
+import { OcspFailureEventPublisher } from '../src/incidents/ocsp-failure-event.publisher';
 import {
   TRUST_ANCHORS,
   loadTrustAnchors,
@@ -28,22 +30,34 @@ const untrustedCertificate = readFileSync(
 
 /**
  * Levanta la aplicación con la MISMA configuración global que producción (`configureApp`), y
- * sustituye sólo el almacén de confianza (por los certificados de prueba) y el OCSP (que saldría a
- * la red contra el SAT).
+ * sustituye sólo el almacén de confianza (por los certificados de prueba), el OCSP (que saldría a
+ * la red contra el SAT) y el publicador de Kafka.
+ *
+ * Monta `CertificateValidationModule` y no `AppModule`: éste arrastra Postgres, Redis y el cron de
+ * incidencias, que no intervienen en la respuesta del endpoint y tienen su propia prueba
+ * (`incidents.e2e-spec.ts`).
  */
 describe('POST /api/v1/certificates/validate (e2e)', () => {
   let app: INestApplication;
   const checkRevocation = jest.fn();
+  const publish = jest.fn();
   let loggedErrors: string[];
 
   beforeAll(async () => {
     process.env.API_KEY = API_KEY;
 
-    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+    const moduleRef = await Test.createTestingModule({
+      imports: [
+        ConfigModule.forRoot({ isGlobal: true }),
+        CertificateValidationModule,
+      ],
+    })
       .overrideProvider(TRUST_ANCHORS)
       .useValue(loadTrustAnchors(join(FIXTURES_DIR, 'trust-anchors')))
       .overrideProvider(OcspService)
       .useValue({ checkRevocation })
+      .overrideProvider(OcspFailureEventPublisher)
+      .useValue({ publish, onModuleDestroy: jest.fn() })
       .compile();
 
     app = moduleRef.createNestApplication({ logger: false });
@@ -57,6 +71,7 @@ describe('POST /api/v1/certificates/validate (e2e)', () => {
 
   beforeEach(() => {
     loggedErrors = [];
+    publish.mockReset().mockResolvedValue(null);
     checkRevocation.mockReset().mockResolvedValue({
       status: 'good',
       verifiedAt: new Date('2026-09-17T18:00:00.000Z'),
@@ -214,6 +229,33 @@ describe('POST /api/v1/certificates/validate (e2e)', () => {
     expectStandardError(response.body, 503, 'OCSP_SERVICE_UNAVAILABLE');
     expect(JSON.stringify(response.body)).not.toContain('ETIMEDOUT');
     expect(loggedErrors.join()).toContain('ETIMEDOUT 200.57.3.1');
+  });
+
+  it('publica el fallo OCSP con el contexto del intento', async () => {
+    const cause = new Error('ETIMEDOUT 200.57.3.1');
+    checkRevocation.mockRejectedValue(
+      new OcspServiceUnavailableException(cause),
+    );
+
+    await post()
+      .send({
+        certificate: leafCertificate,
+        signingRequestId: 'doc-1',
+        userId: 'user-1',
+      })
+      .expect(503);
+
+    expect(publish).toHaveBeenCalledWith(cause, {
+      certificateSerial: expect.any(String),
+      signingRequestId: 'doc-1',
+      userId: 'user-1',
+    });
+  });
+
+  it('no publica nada cuando OCSP responde', async () => {
+    await post().send({ certificate: leafCertificate }).expect(200);
+
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it('responde 200 sin evidencia si el SAT no contesta y la petición lo permite', async () => {
