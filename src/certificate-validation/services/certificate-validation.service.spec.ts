@@ -15,6 +15,7 @@ import { CertificateValidationService } from './certificate-validation.service';
 import { OcspEvidence, OcspService } from './ocsp.service';
 import { loadTrustAnchors } from './trust-anchors.provider';
 import { TrustChainService } from './trust-chain.service';
+import { OcspFailureEventPublisher } from '../../incidents/ocsp-failure-event.publisher';
 
 const FIXTURES_DIR = join(__dirname, '..', '..', '..', 'test', 'fixtures');
 const leafCertificate = readFileSync(join(FIXTURES_DIR, 'leaf.cer')).toString(
@@ -36,15 +37,18 @@ describe('CertificateValidationService', () => {
     ocspUrl: 'https://cfdi.sat.gob.mx/edofiel',
   };
   let checkRevocation: jest.Mock;
+  let publish: jest.Mock;
   let service: CertificateValidationService;
 
   beforeEach(() => {
     checkRevocation = jest.fn().mockResolvedValue(evidence);
+    publish = jest.fn().mockResolvedValue(null);
     service = new CertificateValidationService(
       new TrustChainService(
         loadTrustAnchors(join(FIXTURES_DIR, 'trust-anchors')),
       ),
       { checkRevocation } as unknown as OcspService,
+      { publish } as unknown as OcspFailureEventPublisher,
     );
   });
 
@@ -168,5 +172,64 @@ describe('CertificateValidationService', () => {
     expect(result.isValid).toBe(true);
     expect(result.revocation.status).toBe(REVOCATION_STATUS_ENUM.UNVERIFIED);
     expect(result).not.toHaveProperty('ocspEvidence');
+  });
+
+  describe('publicación del fallo OCSP', () => {
+    it.each([false, true])(
+      'publica el fallo con la causa y el contexto del intento (allowUnverifiedRevocation=%s)',
+      async (allowUnverifiedRevocation) => {
+        const cause = new Error(
+          'Failed to send OCSP request: Operation timed out after 5000ms',
+        );
+        checkRevocation.mockRejectedValue(
+          new OcspServiceUnavailableException(cause),
+        );
+
+        await service
+          .validate({
+            certificate: leafCertificate,
+            allowUnverifiedRevocation,
+            signingRequestId: 'doc-1',
+            userId: 'user-1',
+          })
+          .catch(() => undefined);
+
+        expect(publish).toHaveBeenCalledTimes(1);
+        expect(publish).toHaveBeenCalledWith(cause, {
+          certificateSerial: expect.any(String),
+          signingRequestId: 'doc-1',
+          userId: 'user-1',
+        });
+      },
+    );
+
+    /** Revocado es una respuesta del SAT, no una caída: no cuenta para ninguna incidencia. */
+    it('no publica nada si el certificado está revocado', async () => {
+      checkRevocation.mockRejectedValue(new CertificateRevokedException());
+
+      await expect(
+        service.validate({ certificate: leafCertificate }),
+      ).rejects.toBeInstanceOf(CertificateRevokedException);
+      expect(publish).not.toHaveBeenCalled();
+    });
+
+    it('no publica nada si OCSP respondió', async () => {
+      await service.validate({ certificate: leafCertificate });
+
+      expect(publish).not.toHaveBeenCalled();
+    });
+
+    /** Kafka caído no puede tumbar la validación: la respuesta no espera a la publicación. */
+    it('responde aunque la publicación nunca termine', async () => {
+      publish.mockReturnValue(new Promise(() => undefined));
+      checkRevocation.mockRejectedValue(new OcspServiceUnavailableException());
+
+      const result = await service.validate({
+        certificate: leafCertificate,
+        allowUnverifiedRevocation: true,
+      });
+
+      expect(result.revocation.status).toBe(REVOCATION_STATUS_ENUM.UNVERIFIED);
+    });
   });
 });
